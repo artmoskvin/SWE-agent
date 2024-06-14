@@ -19,3 +19,7 @@ rich-argparse
 flask
 flask-cors
 flask-socketio
+
+# Hide (local)
+-e /Users/artemm/Code/hide-python
+

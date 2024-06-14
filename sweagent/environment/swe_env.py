@@ -23,6 +23,7 @@ from swebench import MAP_VERSION_TO_INSTALL, get_environment_yml, get_requiremen
 import docker
 import docker.errors
 import docker.models.containers
+from hide import HideClient
 from sweagent import REPO_ROOT
 from sweagent.environment.utils import (
     PROCESS_DONE_MARKER_END,
@@ -134,7 +135,7 @@ class SWEEnv(gym.Env):
     # This prefix will be prepended to the image name when caching task images
     cached_image_prefix = "swe-agent-task-env-"
 
-    def __init__(self, args: EnvironmentArguments):
+    def __init__(self, args: EnvironmentArguments, hide: HideClient):
         super().__init__()
         t0 = time.perf_counter()
         self.args = args
@@ -148,6 +149,8 @@ class SWEEnv(gym.Env):
         if not self.args.verbose:
             # fixme: This creates problems if we have multiple instances of this class
             self.logger.disabled = True
+
+        self.hide = hide
 
         #: The commit hash of the swe-agent repository
         self.commit_sha = None
@@ -178,7 +181,7 @@ class SWEEnv(gym.Env):
         self.image_name = args.image_name
         self.container_obj: docker.models.containers.Container | None = None
         self.container: subprocess.Popen | None = None
-        self._reset_container()
+        # self._reset_container()
 
         self.idx = 0
         self.clean_multi_line_functions = lambda x: x
@@ -211,6 +214,7 @@ class SWEEnv(gym.Env):
         assert self.record is not None
         return self.record["repo"].replace("/", "__")
 
+    # TODO: Reimplement using Hide
     def _copy_repo(self) -> str:
         """Clone/copy repository/codebase in container
 
@@ -303,6 +307,7 @@ class SWEEnv(gym.Env):
 
         ### Reset Container ###
 
+        # TODO: think about this
         if self.args.cache_task_images:
             cached_image = self._get_cached_task_image_name()
             if image_exists(cached_image):
@@ -319,12 +324,14 @@ class SWEEnv(gym.Env):
                 self.logger.info(f"Cached image {cached_image} not found, rebuilding task environment...")
 
         # Clone repository if not already cloned
+        # NOTE: Repo should be part of the project config
         self.communicate(input="cd /")
         folders = self.communicate(input="ls").split("\n")
         if self._repo_name not in folders:
             self._copy_repo()
 
         # Clean repository of any modifications + Checkout base commit
+        # NOTE: I assume this is not needed when using Hide
         for cmd in [
             "echo -n > /root/files_to_edit.txt",
             f"cd {self._repo_name}",
@@ -340,6 +347,7 @@ class SWEEnv(gym.Env):
             )
 
         # Reset environment variables
+        # NOTE: Should be part of the project config
         for cmd in [
             'export CURRENT_FILE=""',
             "export CURRENT_LINE=0",
@@ -353,11 +361,13 @@ class SWEEnv(gym.Env):
             )
 
         # Set up environment
+        # NOTE: Should be part of the project config (lifecycle script)
         self.communicate_with_handling(
             "source /root/miniconda3/etc/profile.d/conda.sh",
             error_msg="Failed to source conda",
         )
 
+        # NOTE: this is probably not needed
         system = self.communicate("uname -s").strip().lower()
         arch = self.communicate("uname -m").strip().lower()
         if system == "linux" and arch == "x86_64":
@@ -368,9 +378,12 @@ class SWEEnv(gym.Env):
             )
 
         # Call install environment helper function if specified
+        # NOTE: Should be part of the project config (lifecycle script)
         if self.install_environment:
             self.install_env()
+
         # Install mypy for linting purposes
+        # NOTE: Should be either built in Hide (LSP) or part of image or project config(lifecycle script)
         self.communicate_with_handling("pip install flake8", error_msg="Failed to install flake8 (lint library)")
 
         if self.args.cache_task_images:
@@ -382,10 +395,12 @@ class SWEEnv(gym.Env):
             self.logger.info(f"Container with environment {self.container_obj.id} cached as image {cached_image}")
 
         if apply_test_patch:
+            # NOTE: lifecycle script
             self._apply_test_patch()
         # Write any metadata to info if necessary
         return None, info
 
+    # TODO: Reimplement using Hide
     def _apply_test_patch(self):
         """
         Apply test patch for oracle setting
@@ -484,6 +499,7 @@ class SWEEnv(gym.Env):
             return observation, 0, True, info
         return observation, 0, False, info
 
+    # TODO: Reimplement using Hide
     def close(self) -> None:
         """
         Handle environment shutdown
@@ -559,6 +575,7 @@ class SWEEnv(gym.Env):
         image_name_sanitized = image_name_sanitized.replace(":", "-")
         return f"{image_name_sanitized}-{hash_object.hexdigest()[:10]}"
 
+    # TODO: Reimplement using Hide
     def _init_container(self, cached_image: str | None = None) -> None:
         """
         Handles container initialization. Defines container name and creates it.
@@ -692,6 +709,7 @@ class SWEEnv(gym.Env):
         output = self._communicate(f"/bin/bash -n <<'EOF'\n{input}\nEOF\n")
         return output, self.returncode == 0
 
+    # TODO: Reimplement using Hide
     def communicate(
         self,
         input: str,
@@ -722,6 +740,7 @@ class SWEEnv(gym.Env):
             self.communicate_output = ""
             return ""
 
+    # TODO: Reimplement using Hide
     def communicate_with_handling(self, input: str, error_msg: str, timeout_duration=25) -> str:
         """
         Wrapper for communicate function that raises error if return code is non-zero
@@ -851,6 +870,7 @@ class SWEEnv(gym.Env):
         env_check = self.communicate(f"conda env list | grep {env_name}", timeout_duration=LONG_TIMEOUT)
         return env_check.strip() != ""
 
+    # TODO: Reimplement using Hide
     def install_env(self) -> None:
         """
         Creates conda environment and installs third party dependencies to allow code execution
