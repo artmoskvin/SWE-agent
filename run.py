@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+from hide import HideClient
+
 from sweagent import CONFIG_DIR
 from sweagent.utils.log import get_logger
 
@@ -33,6 +35,7 @@ from dataclasses import dataclass
 from getpass import getuser
 from pathlib import Path
 
+import asyncio
 import yaml
 from rich.markdown import Markdown
 from simple_parsing import parse
@@ -43,14 +46,16 @@ from unidiff import PatchSet
 
 from sweagent.agent.agents import Agent, AgentArguments
 from sweagent.agent.models import ModelArguments
-from sweagent.environment.swe_env import EnvironmentArguments, SWEEnv
+from sweagent.environment.swe_env import EnvironmentArguments, SWEEnv, SWEEnvService
 from sweagent.environment.utils import (
     InvalidGithubURL,
     get_associated_commit_urls,
     get_data_path_name,
     get_gh_issue_data,
+    get_instances,
     parse_gh_issue_url,
 )
+from sweagent.utils.config import keys_config
 
 __doc__: str = """ Run inference. Usage examples:
 
@@ -309,94 +314,135 @@ class Main:
         if args.print_config:
             logger.info(f"📙 Arguments: {args.dumps_yaml()}")
         self.args = args
+        
+        self._github_token: str = keys_config.get("GITHUB_TOKEN", "")  # type: ignore
+
+        # Load Task Instances
+        self.data_path = self.args.data_path
+        self.data = get_instances(
+            self.data_path,
+            self.args.base_commit,
+            self.args.split,
+            token=self._github_token,
+            repo_path=self.args.repo_path,
+        )
+
+        logger.info(f"💽 Loaded dataset from {self.data_path}")
+
         self.agent = Agent("primary", args.agent)
-        self.env = SWEEnv(args.environment)
+        self.hide = HideClient(base_url="localhost:8000") # TODO: make this configurable
+        self.env_service = SWEEnvService(args=args.environment, hide=self.hide)
         self.traj_dir = Path("trajectories") / Path(getuser()) / args.run_name
         self.traj_dir.mkdir(parents=True, exist_ok=True)
         self._save_arguments()
-        default_hooks = [
+        self.default_hooks = [
             SaveApplyPatchHook(),
             OpenPRHook(),
         ]
         self.hooks: list[MainHook] = []
-        for hook in default_hooks:
-            self.add_hook(hook)
 
-    def add_hook(self, hook: MainHook):
-        hook.on_init(args=self.args, agent=self.agent, env=self.env, traj_dir=self.traj_dir)
+    def add_hook(self, hook: MainHook, swe_env: SWEEnv):
+        hook.on_init(args=self.args, agent=self.agent, env=swe_env, traj_dir=self.traj_dir)
         self.hooks.append(hook)
 
-    def run(self, index):
-        # Reset environment
-        instance_id = self.env.data[index]["instance_id"]
-        for hook in self.hooks:
-            hook.on_instance_start(index=index, instance=self.env.data[index])
-        assert isinstance(instance_id, str)  # mypy
-        if self.should_skip(instance_id):
-            for hook in self.hooks:
-                hook.on_instance_skipped()
-            raise _ContinueLoop
-        logger.info("▶️  Beginning task " + str(index))
-
-        observation, info = self.env.reset(index)
-        if info is None:
-            raise _ContinueLoop
-
+    async def run(self, instance: dict, swe_env: SWEEnv):
+        """Runs a task instance."""
         # Get info, patch information
-        issue = getattr(self.env, "query", None)
+        issue = instance.get("problem_statement", None)
         files = []
-        assert self.env.record is not None  # mypy
-        if "patch" in self.env.record:
-            files = "\n".join([f"- {x.path}" for x in PatchSet(self.env.record["patch"]).modified_files])
+
+        if "patch" in instance:
+            files = "\n".join([f"- {x.path}" for x in PatchSet(instance["patch"]).modified_files])
+
         # Get test files, F2P tests information
         test_files = []
-        if "test_patch" in self.env.record:
-            test_patch_obj = PatchSet(self.env.record["test_patch"])
+
+        if "test_patch" in instance:
+            test_patch_obj = PatchSet(instance["test_patch"])
             test_files = "\n".join([f"- {x.path}" for x in test_patch_obj.modified_files + test_patch_obj.added_files])
+
         tests = ""
-        if "FAIL_endTO_PASS" in self.env.record:
-            tests = "\n".join([f"- {x}" for x in self.env.record["FAIL_TO_PASS"]])
+
+        if "FAIL_endTO_PASS" in instance:
+            tests = "\n".join([f"- {x}" for x in instance["FAIL_TO_PASS"]])
 
         setup_args = {"issue": issue, "files": files, "test_files": test_files, "tests": tests}
+        initial_observation = None
+
         info, trajectory = self.agent.run(
             setup_args=setup_args,
-            env=self.env,
-            observation=observation,
+            env=swe_env,
+            observation=initial_observation,
             traj_dir=self.traj_dir,
             return_type="info_trajectory",
         )
-        self._save_predictions(instance_id, info)
+
+        self._save_predictions(instance["instance_id"], info)
+
         for hook in self.hooks:
             hook.on_instance_completed(info=info, trajectory=trajectory)
 
-    def main(self):
+    async def main(self):
         for hook in self.hooks:
             hook.on_start()
-        for index in range(len(self.env.data)):
+
+        for index in range(len(self.data)):
+            logger.info("▶️  Beginning task " + str(index))
+
+            instance = self.data[index]
+            instance_id = instance["instance_id"]
+
+            for hook in self.hooks:
+                hook.on_instance_start(index=index, instance=instance)
+
+            assert isinstance(instance_id, str)  # mypy
+
+            if self.should_skip(instance_id):
+                for hook in self.hooks:
+                    hook.on_instance_skipped()
+
+                logger.info(f"Task {instance_id} skipped")
+                continue
+
+            # TODO: try using a context manager
+            swe_env = None
+
             try:
-                self.run(index)
+                swe_env = await self.env_service.create_env(instance)
+
+                for hook in self.default_hooks:
+                    self.add_hook(hook, swe_env)
+
+                await self.run(instance, swe_env)
             except _ContinueLoop:
+                logger.info(f"Task {instance_id} skipped")
                 continue
             except KeyboardInterrupt:
                 logger.info("Exiting InterCode environment...")
-                self.env.close()
+                if swe_env:
+                    await self.env_service.delete_env(swe_env)
                 break
             except SystemExit:
                 logger.critical("❌ Exiting because SystemExit was called")
-                self.env.close()
-                logger.info("Container closed")
+                if swe_env:
+                    await self.env_service.delete_env(swe_env)
+                    logger.info("Container closed")
                 raise
             except Exception as e:
                 traceback.print_exc()
+
+                if swe_env:
+                    await self.env_service.delete_env(swe_env)
+
                 if self.args.raise_exceptions:
-                    self.env.close()
                     raise e
-                if self.env.record:
-                    logger.warning(f"❌ Failed on {self.env.record['instance_id']}: {e}")
-                else:
-                    logger.warning("❌ Failed on unknown instance")
-                self.env.reset_container()
+
+                logger.warning(f"❌ Failed on {instance_id}: {e}")
                 continue
+            finally:
+                if swe_env:
+                    await self.env_service.delete_env(swe_env)
+
         for hook in self.hooks:
             hook.on_end()
 
@@ -509,7 +555,7 @@ def get_args(args=None) -> ScriptArguments:
 
 
 def main(args: ScriptArguments):
-    Main(args).main()
+    asyncio.run(Main(args).main())
 
 
 if __name__ == "__main__":
