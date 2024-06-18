@@ -1,0 +1,10 @@
+{
+  "include": [
+    "sweagent",
+    "tests",
+    "run.py",
+    "run_replay.py"
+  ],
+  "venvPath": "/Users/artemm/.pyenv/versions/",
+  "venv": "swe-agent"
+}

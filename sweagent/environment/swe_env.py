@@ -11,9 +11,11 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import gymnasium as gym
+from hide.client.hide_client import CreateProjectRequest, Repository, Project, TaskResult
+from hide.devcontainer.model import ImageDevContainer
 import yaml
 from ghapi.all import GhApi
 from git import Repo
@@ -23,17 +25,17 @@ from swebench import MAP_VERSION_TO_INSTALL, get_environment_yml, get_requiremen
 import docker
 import docker.errors
 import docker.models.containers
+from hide import HideClient
 from sweagent import REPO_ROOT
+from sweagent.environment.constants import DEFAULT_PYTHON_IMAGE, DEFAULT_PYTHON_VERSION, PYTHON_IMAGES
 from sweagent.environment.utils import (
     PROCESS_DONE_MARKER_END,
     PROCESS_DONE_MARKER_START,
     InvalidGithubURL,
     copy_anything_to_container,
-    copy_file_to_container,
     format_trajectory_markdown,
     get_container,
     get_gh_issue_data,
-    get_instances,
     image_exists,
     parse_gh_issue_url,
     read_with_timeout,
@@ -127,694 +129,79 @@ class EnvHook:
         """Called when the environment is closed"""
 
 
-class SWEEnv(gym.Env):
-    """Gym environment for SWE-bench. This class should handle all communication with the docker container."""
+class SWEEnvService:
+    """Provisioner for SWE-agent environment"""
 
-    name = "swe_main"
-    # This prefix will be prepended to the image name when caching task images
-    cached_image_prefix = "swe-agent-task-env-"
-
-    def __init__(self, args: EnvironmentArguments):
-        super().__init__()
-        t0 = time.perf_counter()
+    def __init__(self, args: EnvironmentArguments, hide: HideClient):
         self.args = args
-        self.base_commit: str | None = None
-        self.communicate_output: str | None = None
-        self.container_name: str | None = args.container_name
-        self.install_environment = args.install_environment
-        self.logger = get_logger("SWEEnv")
-        self.persistent = args.container_name is not None
-        self.returncode: None | int = None
-        if not self.args.verbose:
-            # fixme: This creates problems if we have multiple instances of this class
-            self.logger.disabled = True
+        self.hide = hide
+        self.logger = get_logger("SWEEnvProvisioner")
 
-        #: The commit hash of the swe-agent repository
-        self.commit_sha = None
-        try:
-            repo = Repo(REPO_ROOT, search_parent_directories=True)
-            self.commit_sha = repo.head.object.hexsha
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:
-            self.logger.exception("Failed to get commit hash for this repo: %s", str(e))
+    async def create_env(self, issue: dict) -> SWEEnv:
+        """Create environment"""
+        install_configs = self._get_install_configs(issue)
+        if not install_configs:
+            # TODO: handle missing install configs
+            raise ValueError("No install configs found")
 
-        self._github_token: str = keys_config.get("GITHUB_TOKEN", "")  # type: ignore
+        # image = self._get_image(install_configs)
+        image = self.args.image_name
+        on_create_command = self._get_on_create_command(install_configs)
+        on_create_command["flake8"] = "pip install flake8"
 
-        # Load Task Instances
-        self.data_path = self.args.data_path
-        self.data = get_instances(
-            self.data_path,
-            self.args.base_commit,
-            self.args.split,
-            token=self._github_token,
-            repo_path=self.args.repo_path,
+        container_config = ImageDevContainer(
+            name="swe-agent-dev",
+            image=image, 
+            containerEnv=self._get_default_env_variables(),
+            onCreateCommand=on_create_command,
         )
-        #: Instance we're currently processing. Gets set in self.reset.
-        self.record: dict[str, Any] | None = None
-        self.logger.info(f"💽 Loaded dataset from {self.data_path}")
 
-        # Establish connection with execution container
-        self.image_name = args.image_name
-        self.container_obj: docker.models.containers.Container | None = None
-        self.container: subprocess.Popen | None = None
-        self._reset_container()
+        repository = Repository(
+            url=self._get_repository_url(issue),
+            commit=issue["base_commit"],
+        )
 
-        self.idx = 0
-        self.clean_multi_line_functions = lambda x: x
-        self.hooks: list[EnvHook] = []
+        request = CreateProjectRequest(
+            repository=repository,
+            devcontainer=container_config,
+        )
 
-        self.logger.debug("Environment initialization took %.2f seconds", time.perf_counter() - t0)
+        # async?
+        project = self.hide.create_project(request)
+        return SWEEnv(args=self.args, hide=self.hide, project=project, record=issue)
 
-    def _get_cached_task_image_name(self) -> str:
-        assert self.record is not None
-        inputs: list[str] = [
-            self.record["repo"],
-            self.record["base_commit"],
-            self.args.environment_setup or "no_setup",
-        ]
-        tag = hashlib.sha256("".join(inputs).encode()).hexdigest()[:50]
-        return f"{self.cached_image_prefix}{tag}"
+    async def delete_env(self, env: SWEEnv):
+        """Delete environment"""
+        self.hide.delete_project(env.project)
 
-    def add_hook(self, hook: EnvHook):
-        """Add `EnvHook` to the environment.
-
-        This allows to inject custom functionality at different stages of the environment
-        lifecycle, in particular to connect SWE-agent to a new interface (like a GUI).
-        """
-        hook.on_init()
-        self.hooks.append(hook)
-
-    @property
-    def _repo_name(self) -> str:
-        """Name of the local copy of the repository"""
-        assert self.record is not None
-        return self.record["repo"].replace("/", "__")
-
-    def _copy_repo(self) -> str:
-        """Clone/copy repository/codebase in container
-
-        Returns:
-            folder name of clone
-        """
-        assert self.container_obj is not None
-        assert self.record is not None  # mypy
-        for hook in self.hooks:
-            hook.on_copy_repo_started(repo_type=self.record["repo_type"], repo_path=self.record["repo"])
-        if self.record["repo_type"] == "local":
-            copy_anything_to_container(
-                self.container_obj,
-                self.record["repo"].removeprefix("local://"),
-                "/" + self._repo_name,
-            )
-            self.communicate_with_handling(
-                input=f"chown -R root:root {self._repo_name}",
-                error_msg="Failed to change permissions on copied repository",
-            )
-            return self._repo_name
-        assert self.record["repo_type"] == "github"
-        token_prefix = ""
-        if self._github_token:
-            token_prefix = f"{self._github_token}@"
+    def _get_repository_url(self, issue: dict) -> str:
+        """Get repository URL from issue data"""
+        # TODO: Using the token in the URL is a security risk
+        github_token = keys_config.get("GITHUB_TOKEN", "")  # type: ignore
+        token_prefix = f"{github_token}@" if github_token else ""
         # fixme: This if statement is brittle and should probably be replaced with better logic
-        if not self.args.no_mirror and self.record["problem_statement_source"] == "swe-bench":
-            self.logger.info(f"{self._repo_name} not found in container, cloning...")
-            clone_url = f"https://{token_prefix}github.com/swe-bench/{self._repo_name}.git"
+        if not self.args.no_mirror and issue["problem_statement_source"] == "swe-bench":
+            repo_name = issue["repo"].replace("/", "__")
+            self.logger.info(f"{token_prefix} not found in container, cloning...")
+            return f"https://{token_prefix}github.com/swe-bench/{repo_name}.git"
         else:
             self.logger.info("Trying to clone from non-mirror...")
-            clone_url = f"https://{token_prefix}github.com/{self.record['repo']}.git"
-        clone_method = keys_config.get("SWE_AGENT_CLONE_METHOD", default="sparse", choices=["sparse", "full"])
-        if len(self.data) > 1 or self.persistent:
-            msg = "Falling back to full cloning method due to multiple instances or persistent container"
-            self.logger.debug(msg)
-        if clone_method == "full":
-            self.communicate_with_handling(
-                input=f"git clone {clone_url} {self._repo_name}",
-                error_msg="Failed to clone repository from conservative method",
-                timeout_duration=LONG_TIMEOUT,
-            )
-        else:
-            base_commit = self.record["base_commit"]
-            self.communicate_with_handling(
-                input="&&".join(
-                    (
-                        f"mkdir {self._repo_name}",
-                        f"cd {self._repo_name}",
-                        "git init",
-                        f"git remote add origin {clone_url}",
-                        f"git fetch --depth 1 origin {base_commit}",
-                        "git checkout FETCH_HEAD",
-                        "cd ..",
-                    )
-                ),
-                error_msg="Failed to clone repository with fast method",
-                timeout_duration=LONG_TIMEOUT,
-            )
-        return self._repo_name
+            return f"https://github.com/{issue['repo']}.git"
 
-    def reset(self, index: int | None = None, apply_test_patch: bool = False) -> tuple[str | None, dict]:
-        """
-        Function to reset container between each task instance.
+    def _get_default_env_variables(self) -> dict[str, str]:
+        """Get default environment variables"""
+        return {
+            "CURRENT_FILE": "",
+            "CURRENT_LINE": "0",
+            "SEARCH_RESULTS": "()",
+            "SEARCH_FILES": "()",
+            "SEARCH_INDEX": "0",
+        }
 
-        * Clones instance's repository
-        * Cleans repository of prior modifications
-        * Resets environment variables
-        * Check out base commit
-
-        Args:
-            index: index of task instance to reset to
-
-        Returns:
-            observation: output from container
-            info: additional information (e.g. debugging information)
-        """
-        info = {}
-        info["commit_sha"] = self.commit_sha
-
-        # Get task instance
-        self.idx = index if index is not None else self.idx
-        self.record = self.data[self.idx]
-        self.idx += 1
-
-        # Set query, gold command
-        self.base_commit = self.record["base_commit"]
-        self.query = self.record["problem_statement"]
-        self.reward = None
-
-        ### Reset Container ###
-
-        if self.args.cache_task_images:
-            cached_image = self._get_cached_task_image_name()
-            if image_exists(cached_image):
-                self.logger.info(f"Restore environment from cached image {cached_image}")
-                self.close()  # stop current container
-                self._init_container(cached_image=cached_image)
-                self.communicate("export $(xargs </.env)")
-                envs = self.communicate("env")
-                self.logger.debug(f"Environment variables restored from the image:\n{envs}\n")
-                if apply_test_patch:
-                    self._apply_test_patch()
-                return None, info
-            else:
-                self.logger.info(f"Cached image {cached_image} not found, rebuilding task environment...")
-
-        # Clone repository if not already cloned
-        self.communicate(input="cd /")
-        folders = self.communicate(input="ls").split("\n")
-        if self._repo_name not in folders:
-            self._copy_repo()
-
-        # Clean repository of any modifications + Checkout base commit
-        for cmd in [
-            "echo -n > /root/files_to_edit.txt",
-            f"cd {self._repo_name}",
-            "export ROOT=$(pwd -P)",
-            "git status",
-            "git restore .",
-            f"git reset --hard {self.base_commit}",
-            "git clean -fdxq",
-        ]:
-            self.communicate_with_handling(
-                input=cmd,
-                error_msg="Failed to clean repository",
-            )
-
-        # Reset environment variables
-        for cmd in [
-            'export CURRENT_FILE=""',
-            "export CURRENT_LINE=0",
-            "export SEARCH_RESULTS=()",
-            "export SEARCH_FILES=()",
-            "export SEARCH_INDEX=0",
-        ]:
-            self.communicate_with_handling(
-                input=cmd,
-                error_msg="Failed to reset environment variables",
-            )
-
-        # Set up environment
-        self.communicate_with_handling(
-            "source /root/miniconda3/etc/profile.d/conda.sh",
-            error_msg="Failed to source conda",
-        )
-
-        system = self.communicate("uname -s").strip().lower()
-        arch = self.communicate("uname -m").strip().lower()
-        if system == "linux" and arch == "x86_64":
-            self.communicate_with_handling(
-                "apt update; apt install build-essential -y",
-                error_msg="Failed to install build-essential",
-                timeout_duration=LONG_TIMEOUT,
-            )
-
-        # Call install environment helper function if specified
-        if self.install_environment:
-            self.install_env()
-        # Install mypy for linting purposes
-        self.communicate_with_handling("pip install flake8", error_msg="Failed to install flake8 (lint library)")
-
-        if self.args.cache_task_images:
-            envs = self.communicate("env")
-            self.logger.debug(f"Environment variables to save:\n{envs}\n")
-            self.communicate("env >> /.env")
-            assert self.container_obj is not None  # mypy
-            self.container_obj.commit(cached_image)
-            self.logger.info(f"Container with environment {self.container_obj.id} cached as image {cached_image}")
-
-        if apply_test_patch:
-            self._apply_test_patch()
-        # Write any metadata to info if necessary
-        return None, info
-
-    def _apply_test_patch(self):
-        """
-        Apply test patch for oracle setting
-        """
-        assert self.record is not None
-        path_to_patch = "test.patch"
-        with open(path_to_patch, "w") as f:
-            f.write(self.record["test_patch"])
-        subprocess.run(
-            f"docker cp {path_to_patch} {self.container_name}:/root/test.patch",
-            shell=True,
-            check=False,
-        )
-        self.communicate_with_handling(
-            input="git apply /root/test.patch",
-            error_msg="Failed to apply test patch correctly",
-        )
-        os.remove(path_to_patch)
-
-    def step(self, action: str) -> tuple[str | None, int, bool, dict]:
-        """
-        Runs given action in environment and returns corresponding output
-
-        Args:
-            action: command to run in bash shell
-
-        Returns:
-            observation:  output from container
-            reward: value between 0 and 1 quantifying correctness of output + environment state
-            done: whether task is over
-            info: additional information (e.g. debugging information)
-        """
-        info = {}
-
-        observation = ""
-        # Handle special actions
-        if action.strip() == "skip":
-            observation = "Skipped"
-            info["exit_status"] = "skipped"
-            return observation, 0, True, info
-        if action in {"exit_context", "exit_cost", "exit_error", "exit_format", "exit_api"}:
-            try:
-                observation = self.communicate(input="submit")
-                submission = self.get_submission(observation)
-                assert submission is not None and submission.strip() != "", AssertionError("No submission found.")
-                self.logger.info(f"Found submission: {submission}")
-                info["exit_status"] = f"submitted ({action})"
-                info["submission"] = submission
-                observation = "Exited (autosubmitted)"
-                self.logger.info("Exiting with autosubmission")
-                return observation, 0, True, info
-            except KeyboardInterrupt:
-                raise
-            except:
-                observation = "Exited"
-                info["exit_status"] = action
-                return observation, 0, True, info
-
-        # Attempt to run action in container
-        observation = ""
-        try:
-            observation = self.communicate(input=action, timeout_duration=25)
-        except TimeoutError:
-            try:
-                self.interrupt()
-                observation += "\nEXECUTION TIMED OUT"
-            except RuntimeError as e:
-                observation += "\nEXECUTION TIMED OUT AND INTERRUPT FAILED. RESTARTING PROCESS."
-                info["exit_status"] = "early_exit"
-                self.logger.warning(f"Failed to interrupt container: {e}\nRESTARTING PROCESS.")
-                self.reset_container()
-                return observation, 0, True, info
-        except RuntimeError as e:
-            observation += "\nCOMMAND FAILED TO EXECUTE. RESTARTING PROCESS."
-            info["exit_status"] = "early_exit"
-            self.logger.warning(f"Failed to execute command: {e}\nRESTARTING PROCESS.")
-            self.reset_container()
-            return observation, 0, True, info
-        except BrokenPipeError as e:
-            observation += "\nBROKEN PIPE ERROR. RESTARTING PROCESS."
-            info["exit_status"] = "early_exit"
-            self.logger.error(f"Broken pipe error: {e}\nRESTARTING PROCESS.")
-            self.reset_container()
-            return observation, 0, True, info
-        except Exception:
-            observation += "\nEXECUTION FAILED OR COMMAND MALFORMED"
-            self.logger.exception("Unknown exception")
-
-        # Record submission and end episode if `submit` keyword found
-        submission = self.get_submission(observation)
-        if submission is not None:
-            self.logger.info(f"Found submission: {submission}")
-            info["exit_status"] = "submitted"
-            info["submission"] = submission if submission.strip() != "" else None
-            observation = submission if submission.strip() != "" else None
-            return observation, 0, True, info
-        return observation, 0, False, info
-
-    def close(self) -> None:
-        """
-        Handle environment shutdown
-        """
-        self.logger.info("Beginning environment shutdown...")
-        try:
-            self.communicate(input="exit")
-        except KeyboardInterrupt:
-            raise
-        except:
-            self.logger.warning("Errors when exiting container", exc_info=True)
-        assert self.container is not None  # mypy
-        self.container.terminate()
-        if self.container_obj is None:
-            pass
-        elif self.persistent:
-            # stopping is Podman specific, but doesn't hurt to include
-            # https://stackoverflow.com/a/32428199/
-            # Sleeping to avoid https://github.com/princeton-nlp/SWE-agent/issues/496 ??
-            time.sleep(0.1)
-            if self.container_obj.status not in {"paused", "exited", "dead", "stopping"}:
-                try:
-                    self.container_obj.pause()
-                except Exception:
-                    self.logger.warning("Failed to pause container.", exc_info=True)
-                except KeyboardInterrupt:
-                    raise
-                else:
-                    self.logger.info("Agent container paused")
-            else:
-                self.logger.info(f"Agent container status: {self.container_obj.status}")
-        else:
-            try:
-                self.container_obj.remove(force=True)
-            except KeyboardInterrupt:
-                raise
-            except Exception:
-                self.logger.warning("Failed to remove container", exc_info=True)
-            else:
-                self.logger.info("Agent container stopped")
-        for hook in self.hooks:
-            hook.on_close()
-
-    # MARK: Helper functions #
-
-    def _reset_container(self) -> None:
-        if self.container is not None:
-            try:
-                self.container.terminate()
-            except KeyboardInterrupt:
-                raise
-            except:
-                self.logger.warning("Failed to terminate container", exc_info=True)
-            else:
-                self.logger.debug("Terminated container")
-        self._init_container()
-        self._init_scripts()
-
-    def reset_container(self) -> None:
-        self.close()
-        self.container = None
-        self.container_obj = None
-        self._reset_container()
-
-    @staticmethod
-    def _get_container_name(image_name: str) -> str:
-        """Return name of container"""
-        process_id = str(os.getpid())
-        current_time = str(datetime.datetime.now())
-        unique_string = current_time + process_id
-        hash_object = hashlib.sha256(unique_string.encode())
-        image_name_sanitized = image_name.replace("/", "-")
-        image_name_sanitized = image_name_sanitized.replace(":", "-")
-        return f"{image_name_sanitized}-{hash_object.hexdigest()[:10]}"
-
-    def _init_container(self, cached_image: str | None = None) -> None:
-        """
-        Handles container initialization. Defines container name and creates it.
-        If cached_image is provided, it will use that image name instead of the default.
-        """
-        image_name = self.image_name
-        if cached_image is not None:
-            image_name = cached_image
-            self.logger.info(f"Using cached image: {image_name}")
-        if self.persistent:
-            assert self.container_name is not None
-        else:
-            # Make sure that we get a new container name just in case removing didn't work.
-            # Might be a fix for https://github.com/princeton-nlp/SWE-agent/issues/451
-            self.container_name = self._get_container_name(image_name)
-        self.container, self.parent_pids = get_container(self.container_name, image_name, persistent=self.persistent)
-        try:
-            client = docker.from_env(timeout=600)
-        except docker.errors.DockerException as e:
-            if "Error while fetching server API version" in str(e):
-                msg = "Docker is not running. Please start Docker and try again."
-            else:
-                msg = "Unknown docker exception occurred. Are you sure docker is running?"
-            raise RuntimeError(msg) from e
-        t0 = time.time()
-        self.container_obj = None
-        while time.time() - t0 < 60:
-            try:
-                self.container_obj = client.containers.get(self.container_name)
-            except docker.errors.NotFound:
-                self.logger.debug("Couldn't find container. Let's wait and retry.")
-                time.sleep(1)
-            else:
-                break
-        else:
-            print(f"{self.persistent=}")
-            available_containers = client.containers.list(all=True)
-            available_containers_info = json.dumps([str(c.attrs) for c in available_containers], indent=2)
-            print(available_containers_info)
-            msg = "Failed to get container object."
-            raise RuntimeError(msg)
-        self.logger.info("🌱 Environment Initialized")
-
-    def _init_scripts(self):
-        """
-        Initialize custom commands within container
-        """
-        self.communicate_with_handling(
-            "source /root/.bashrc",
-            error_msg="Failed to source .bashrc",
-        )
-        self.communicate_with_handling(
-            "mkdir -p /root/commands",
-            error_msg="Failed to create commands directory",
-        )
-        self.communicate_with_handling(
-            "touch /root/commands/__init__.py",
-            error_msg="Failed to create __init__.py",
-        )
-        self.communicate_with_handling(
-            "export PATH=$PATH:/root/commands",
-            error_msg="Failed to add commands directory to PATH",
-        )
-
-    def _communicate_experimental(
-        self,
-        input: str,
-        timeout_duration=25,
-    ) -> str:
-        """Experimental version of `_communicate`"""
-        assert self.container is not None
-        command_suffix = f"echo {PROCESS_DONE_MARKER_START}$?{PROCESS_DONE_MARKER_END}\n"
-        try:
-            self.returncode = None
-            cmd = input if input.endswith("\n") else input + "\n"
-            cmd += command_suffix
-            os.write(self.container.stdin.fileno(), cmd.encode())
-            time.sleep(0.03)
-            self.container.stdin.flush()
-        except BrokenPipeError:
-            traceback.print_exc()
-            self.logger.error("Failed to communicate with container. Check docker logs for more information.")
-            msg = "Failed to communicate with container"
-            raise RuntimeError(msg)
-
-        buffer, exit_code = read_with_timeout_experimental(self.container, timeout_duration)
-        self.returncode = int(exit_code)
-        return buffer
-
-    def _communicate(
-        self,
-        input: str,
-        timeout_duration=25,
-    ) -> str:
-        assert self.container is not None
-        communicate_method = keys_config.get(
-            "SWE_AGENT_COMMUNICATE_METHOD", default="end-marker", choices=["end-marker", "processes"]
-        )
-        if communicate_method == "end-marker":
-            return self._communicate_experimental(input, timeout_duration)
-        try:
-            self.returncode = None
-            cmd = input if input.endswith("\n") else input + "\n"
-            os.write(self.container.stdin.fileno(), cmd.encode())
-            time.sleep(0.1)
-            self.container.stdin.flush()
-        except BrokenPipeError:
-            traceback.print_exc()
-            self.logger.error("Failed to communicate with container. Check docker logs for more information.")
-            msg = "Failed to communicate with container"
-            raise RuntimeError(msg)
-        try:
-            buffer = read_with_timeout(self.container, self.get_pids, timeout_duration)
-            self.container.stdin.write("echo $?\n")
-            time.sleep(0.1)
-            self.container.stdin.flush()
-            exit_code = read_with_timeout(self.container, self.get_pids, 5).strip()
-        except Exception as e:
-            self.logger.error(f"Read with timeout failed on input:\n---\n{input}\n---")
-            raise e
-        if not exit_code.isdigit():
-            msg = f"Container crashed. Failed to get exit code. Output:\n---\n{buffer}\n---"
-            raise RuntimeError(msg)
-        self.returncode = int(exit_code)
-        return buffer
-
-    def _check_syntax(self, input: str):
-        """
-        Saves environment variables to file
-        """
-        output = self._communicate(f"/bin/bash -n <<'EOF'\n{input}\nEOF\n")
-        return output, self.returncode == 0
-
-    def communicate(
-        self,
-        input: str,
-        timeout_duration=25,
-    ) -> str:
-        """
-        Sends input to container and returns output
-
-        Args:
-            input: input to send to container
-
-        Returns:
-            output: output from container
-        """
-        if input.strip() != "exit":
-            output, valid = self._check_syntax(input)
-            if not valid:
-                return output  # shows syntax errors
-            output = self._communicate(
-                input,
-                timeout_duration=timeout_duration,
-            )
-            self.communicate_output = output
-            return output
-        else:
-            self.container.terminate()
-            self.returncode = 0
-            self.communicate_output = ""
-            return ""
-
-    def communicate_with_handling(self, input: str, error_msg: str, timeout_duration=25) -> str:
-        """
-        Wrapper for communicate function that raises error if return code is non-zero
-
-        Args:
-            input: input to send to container
-            error_msg: error message to raise if return code is non-zero
-            timeout_duration: duration to wait for output
-
-        Returns:
-            output: output from container
-        """
-        logs = self.communicate(input, timeout_duration=timeout_duration)
-        if self.returncode != 0:
-            self.logger.error(f"{error_msg}: {logs}")
-            self.close()
-            msg = f"{error_msg}: {logs}"
-            raise RuntimeError(msg)
-        return logs
-
-    def get_available_actions(self) -> list[str]:
-        """
-        Returns list of available actions in current environment state
-
-        Currently not in use.
-        """
-        return []
-
-    def get_pids(self, all_pids=False) -> list[str]:
-        """
-        Gets list of processes running inside docker container
-
-        Args:
-            all_pids: whether to return all pids, or whether to exclude ps
-                and parent PIDs
-
-        Returns:
-            list of PIDs
-        """
-        pids = self.container_obj.exec_run("ps -eo pid,comm --no-headers").output.decode().split("\n")
-        pids = [x.split() for x in pids if x]
-        if not all_pids:
-            pids = [x for x in pids if x[1] != "ps" and x[0] not in self.parent_pids]
-        return pids
-
-    def get_submission(self, output: str) -> str:
-        """
-        Function for extracting diff patch submission at the end of an episode.
-
-        Args:
-            output: `submit` observation
-
-        Returns:
-            submission: diff patch submission
-        """
-        pattern = r"\<\<SUBMISSION\|\|(.*)\|\|SUBMISSION\>\>"
-        match = re.search(pattern, output, re.DOTALL)
-        if match is None:
-            return None
-        return match.group(1)
-
-    def run_shell_script(self, script_path: Path, *, location: str) -> None:
-        """Run custom script supplied by user at `script_path`
-
-        Args:
-            script_path: path to script file
-            location: location of script file 'host' or 'container'
-        """
-        if location == "host":
-            return self._run_shell_script_host(script_path)
-        elif location == "container":
-            raise NotImplementedError
-        msg = f"Invalid 'location': {location}"
-        raise ValueError(msg)
-
-    def _run_shell_script_host(self, script_path: Path) -> None:
-        """Run shell script file (located on host) in container"""
-        if not script_path.is_file():
-            msg = f"Script not found at {script_path}"
-            raise FileNotFoundError(msg)
-        shell_commands = Path(script_path).read_text().splitlines(keepends=True)
-        for i, cmd in enumerate(shell_commands):
-            self.communicate_with_handling(
-                cmd,
-                error_msg=f"Failed to execute line {i}.",
-                timeout_duration=LONG_TIMEOUT,
-            )
-
-    def _get_install_configs(self) -> dict | None:
+    def _get_install_configs(self, issue: dict) -> dict | None:
         """Return config for environment setup"""
-        assert self.record is not None  # mypy
         if (
-            self.record["problem_statement_source"] != "swe-bench" or self.record["repo_type"] == "local"
+            issue["problem_statement_source"] != "swe-bench" or issue["repo_type"] == "local"
         ) and self.args.environment_setup is None:
             self.logger.warning(
                 "install_environment is set to True, but the data path is a GitHub URL "
@@ -839,7 +226,7 @@ class SWEEnv(gym.Env):
                 raise ValueError(msg)
         else:
             try:
-                return MAP_VERSION_TO_INSTALL[self.record["repo"]][str(self.record["version"])]
+                return MAP_VERSION_TO_INSTALL[issue["repo"]][str(issue["version"])]
             except KeyError as e:
                 msg = (
                     "Tried to look up install configs in swe-bench, but failed. "
@@ -847,155 +234,373 @@ class SWEEnv(gym.Env):
                 )
                 raise ValueError(msg) from e
 
-    def _conda_environment_exists(self, env_name: str) -> bool:
-        env_check = self.communicate(f"conda env list | grep {env_name}", timeout_duration=LONG_TIMEOUT)
-        return env_check.strip() != ""
+    def _get_image(self, install_configs: dict[str, str]) -> str:
+        python_version = install_configs.get("python", DEFAULT_PYTHON_VERSION)
+        return PYTHON_IMAGES.get(python_version, DEFAULT_PYTHON_IMAGE)
 
-    def install_env(self) -> None:
-        """
-        Creates conda environment and installs third party dependencies to allow code execution
-        """
-        t0 = time.perf_counter()
-        for hook in self.hooks:
-            hook.on_install_env_started()
-        install_configs = self._get_install_configs()
-        if not install_configs:
-            return
-        if "shell_script_path" in install_configs:
-            assert len(install_configs) == 1
-            self.run_shell_script(Path(install_configs["shell_script_path"]), location="host")
-            return
-        assert self.record is not None  # mypy
-        # Create environment if does not exist yet
-        env_name = f"{self._repo_name}__{self.record['version']}"
-        if not self._conda_environment_exists(env_name):
-            self.logger.info(f"{env_name} conda env not found, creating...")
-            packages = install_configs.get("packages", "")
+    def _get_on_create_command(self, install_configs: dict[str, str]) -> dict[str, str]:
+        commands = {}
+
+        if "packages" in install_configs:
+            packages = install_configs["packages"]
+
             if packages == "requirements.txt":
-                # Create conda environment
-                self.communicate_with_handling(
-                    f"conda create -n {env_name} python={install_configs['python']} -y",
-                    error_msg="Failed to create conda environment",
-                    timeout_duration=LONG_TIMEOUT,
-                )
-                self.logger.debug("Created conda environment")
-                # Write reqs to requirements.txt in docker container
-                content_reqs = get_requirements(self.record)
-                copy_file_to_container(self.container_obj, content_reqs, PATH_TO_REQS)
-                # Create conda environment + install reqs
-                self.communicate_with_handling(
-                    f"conda activate {env_name}",
-                    error_msg="Failed to activate conda environment",
-                )
-                self.communicate_with_handling(
-                    f"pip install -r {PATH_TO_REQS}",
-                    error_msg="Failed to install requirements.txt",
-                    timeout_duration=LONG_TIMEOUT,
-                )
-                self.logger.debug("Installed requirements from requirements.txt")
-                self.communicate(f"rm {PATH_TO_REQS}")
+                commands["packages"] = "pip install -r requirements.txt"
             elif packages == "environment.yml":
-                # Write environment.yml to file
-                if install_configs.get("no_use_env"):
-                    content_env_yml = get_environment_yml(self.record, env_name)
-                else:
-                    content_env_yml = get_environment_yml(
-                        self.record,
-                        env_name,
-                        python_version=install_configs["python"],
-                    )
-                copy_file_to_container(self.container_obj, content_env_yml, PATH_TO_ENV_YML)
-                if install_configs.get("no_use_env"):
-                    # Create conda environment
-                    self.communicate_with_handling(
-                        f"conda create -c conda-forge -n {env_name} python={install_configs['python']} -y",
-                        error_msg="Failed to create conda environment",
-                        timeout_duration=LONG_TIMEOUT,
-                    )
-                    self.logger.debug("Created conda environment")
-                    # Install packages
-                    self.communicate_with_handling(
-                        f"conda env update -f {PATH_TO_ENV_YML}",
-                        error_msg="Failed to install environment.yml",
-                        timeout_duration=LONG_TIMEOUT,
-                    )
-                    self.logger.debug("Installed packages from environment.yml")
-                else:
-                    # Create environment + install packages
-                    self.communicate_with_handling(
-                        f"conda env create --file {PATH_TO_ENV_YML}",
-                        error_msg="Failed to create conda environment with environment.yml",
-                        timeout_duration=LONG_TIMEOUT,
-                    )
-                    self.logger.debug("Created conda environment with environment.yml")
-                self.communicate(f"rm {PATH_TO_ENV_YML}")
+                # TODO: add support for conda environment
+                raise NotImplementedError("Conda environment is not supported yet.")
             else:
-                python_env = f"python{install_configs['python']}"
-                if self._conda_environment_exists(python_env):
-                    self.communicate_with_handling(
-                        f"conda create --name {env_name} --clone {python_env}",
-                        error_msg="Failed to clone conda environment",
-                        timeout_duration=LONG_TIMEOUT,
-                    )
-                    self.logger.debug("Cloned python conda environment")
-                else:
-                    self.logger.debug(f"Could not find {python_env}, creating new environment")
-                    self.communicate_with_handling(
-                        f"conda create -n {env_name} python={install_configs['python']} -y",
-                        error_msg="Failed to create conda environment",
-                        timeout_duration=LONG_TIMEOUT,
-                    )
-                self.communicate_with_handling(
-                    f"conda activate {env_name}",
-                    error_msg="Failed to activate conda environment",
-                )
-                if packages.strip():
-                    self.communicate_with_handling(
-                        f"conda install {packages} -y",
-                        error_msg="Failed to install packages",
-                        timeout_duration=LONG_TIMEOUT,
-                    )
-                    self.logger.debug("Installed conda packages")
-            # Install extra pip packages if specified
-            if install_configs.get("pip_packages"):
-                self.communicate_with_handling(
-                    f"source activate {env_name} && pip install {' '.join(install_configs['pip_packages'])}",
-                    error_msg="Failed to install pip packages",
-                    timeout_duration=LONG_TIMEOUT,
-                )
-                self.logger.debug("Installed extra pip dependencies")
+                commands["packages"] = f"pip install {packages}"
 
-        # Activate environment
-        self.communicate_with_handling(f"conda activate {env_name}", error_msg="Failed to activate conda environment")
+        if "pip_packages" in install_configs:
+            pip_packages = install_configs["pip_packages"]
+            commands["pip_packages"] = f"pip install {' '.join(pip_packages)}"
 
-        # Install repo at base commit
-        if install_configs.get("pre_install"):
-            self.logger.info("Running pre-install commands...")
-            for pre_install_cmd in install_configs["pre_install"]:
-                self.communicate_with_handling(
-                    pre_install_cmd,
-                    error_msg="Pre-install commands failed to execute successfully",
-                )
-            self.logger.debug("Ran pre-install commands")
-        self.logger.info(f"Installing {self._repo_name} at base commit...")
-        if install_configs.get("install"):
-            install_cmd = install_configs["install"]
-            self.communicate_with_handling(
-                install_cmd,
-                error_msg="Install command failed to execute successfully",
-                timeout_duration=LONG_TIMEOUT,
+        if "pre_install" in install_configs:
+            pre_install = install_configs["pre_install"]
+            commands["pre_install"] = pre_install
+
+        if "install" in install_configs:
+            install = install_configs["install"]
+            commands["install"] = install
+
+        if "post_install" in install_configs:
+            post_install = install_configs["post_install"]
+            commands["post_install"] = post_install
+
+        return commands
+
+class SWEEnv(gym.Env):
+    """Gym environment for SWE-bench. This class should handle all communication with the docker container."""
+
+    name = "swe_main"
+    # This prefix will be prepended to the image name when caching task images
+    cached_image_prefix = "swe-agent-task-env-"
+
+    def __init__(self, args: EnvironmentArguments, hide: HideClient, project: Project, record: dict):
+        super().__init__()
+        t0 = time.perf_counter()
+        self.args = args
+        self.base_commit: str | None = None
+        self.communicate_output: str | None = None
+        self.container_name: str | None = args.container_name
+        self.install_environment = args.install_environment
+        self.logger = get_logger("SWEEnv")
+        self.persistent = args.container_name is not None
+        self.returncode: None | int = None
+        if not self.args.verbose:
+            # fixme: This creates problems if we have multiple instances of this class
+            self.logger.disabled = True
+
+        self.hide = hide
+        self.project = project
+
+        #: The commit hash of the swe-agent repository
+        self.commit_sha = None
+        try:
+            repo = Repo(REPO_ROOT, search_parent_directories=True)
+            self.commit_sha = repo.head.object.hexsha
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            self.logger.exception("Failed to get commit hash for this repo: %s", str(e))
+
+        self._github_token: str = keys_config.get("GITHUB_TOKEN", "")  # type: ignore
+
+        self.record = record
+        self.clean_multi_line_functions = lambda x: x
+        self.hooks: list[EnvHook] = []
+
+        # TODO: do it when creating the container
+        self._init_scripts()
+
+        self.logger.debug("Environment initialization took %.2f seconds", time.perf_counter() - t0)
+
+    def step(self, action: str) -> tuple[str | None, int, bool, dict]:
+        """
+        Runs given action in environment and returns corresponding output
+
+        Args:
+            action: command to run in bash shell
+
+        Returns:
+            observation:  output from container
+            reward: value between 0 and 1 quantifying correctness of output + environment state
+            done: whether task is over
+            info: additional information (e.g. debugging information)
+        """
+        info = {}
+
+        observation = ""
+        # Handle special actions
+        if action.strip() == "skip":
+            observation = "Skipped"
+            info["exit_status"] = "skipped"
+            return observation, 0, True, info
+        if action in {"exit_context", "exit_cost", "exit_error", "exit_format", "exit_api"}:
+            try:
+                output = self.communicate(input="submit")
+                observation = output.stdOut if output.stdOut else output.stdErr
+                submission = self.get_submission(observation)
+                assert submission is not None and submission.strip() != "", AssertionError("No submission found.")
+                self.logger.info(f"Found submission: {submission}")
+                info["exit_status"] = f"submitted ({action})"
+                info["submission"] = submission
+                observation = "Exited (autosubmitted)"
+                self.logger.info("Exiting with autosubmission")
+                return observation, 0, True, info
+            except KeyboardInterrupt:
+                raise
+            except:
+                observation = "Exited"
+                info["exit_status"] = action
+                return observation, 0, True, info
+
+        # Attempt to run action in container
+        observation = ""
+        try:
+            output = self.communicate(input=action, timeout_duration=25)
+            observation = output.stdOut if output.stdOut else output.stdErr
+        except TimeoutError:
+            try:
+                self.interrupt()
+                observation += "\nEXECUTION TIMED OUT"
+            except RuntimeError as e:
+                observation += "\nEXECUTION TIMED OUT AND INTERRUPT FAILED. RESTARTING PROCESS."
+                info["exit_status"] = "early_exit"
+                self.logger.warning(f"Failed to interrupt container: {e}\nRESTARTING PROCESS.")
+                return observation, 0, True, info
+        except RuntimeError as e:
+            observation += "\nCOMMAND FAILED TO EXECUTE. RESTARTING PROCESS."
+            info["exit_status"] = "early_exit"
+            self.logger.warning(f"Failed to execute command: {e}\nRESTARTING PROCESS.")
+            return observation, 0, True, info
+        except BrokenPipeError as e:
+            observation += "\nBROKEN PIPE ERROR. RESTARTING PROCESS."
+            info["exit_status"] = "early_exit"
+            self.logger.error(f"Broken pipe error: {e}\nRESTARTING PROCESS.")
+            return observation, 0, True, info
+        except Exception:
+            observation += "\nEXECUTION FAILED OR COMMAND MALFORMED"
+            self.logger.exception("Unknown exception")
+
+        # Record submission and end episode if `submit` keyword found
+        submission = self.get_submission(observation)
+        if submission is not None:
+            self.logger.info(f"Found submission: {submission}")
+            info["exit_status"] = "submitted"
+            info["submission"] = submission if submission.strip() != "" else None
+            observation = submission if submission.strip() != "" else None
+            return observation, 0, True, info
+        return observation, 0, False, info
+
+    def close(self) -> None:
+        """
+        Handle environment shutdown
+        """
+        self.logger.info("Beginning environment shutdown...")
+
+        try:
+            self.hide.delete_project(self.project)
+        except KeyboardInterrupt:
+            raise
+        except:
+            self.logger.warning("Errors when exiting container", exc_info=True)
+
+        for hook in self.hooks:
+            hook.on_close()
+
+    # MARK: Helper functions #
+
+    def _reset_container(self) -> None:
+        # if self.container is not None:
+        #     try:
+        #         self.container.terminate()
+        #     except KeyboardInterrupt:
+        #         raise
+        #     except:
+        #         self.logger.warning("Failed to terminate container", exc_info=True)
+        #     else:
+        #         self.logger.debug("Terminated container")
+        # self._init_container()
+        self._init_scripts()
+
+    # @staticmethod
+    # def _get_container_name(image_name: str) -> str:
+    #     """Return name of container"""
+    #     process_id = str(os.getpid())
+    #     current_time = str(datetime.datetime.now())
+    #     unique_string = current_time + process_id
+    #     hash_object = hashlib.sha256(unique_string.encode())
+    #     image_name_sanitized = image_name.replace("/", "-")
+    #     image_name_sanitized = image_name_sanitized.replace(":", "-")
+    #     return f"{image_name_sanitized}-{hash_object.hexdigest()[:10]}"
+
+    # def _init_container(self, cached_image: str | None = None) -> None:
+    #     """
+    #     Handles container initialization. Defines container name and creates it.
+    #     If cached_image is provided, it will use that image name instead of the default.
+    #     """
+    #     image_name = self.image_name
+    #     if cached_image is not None:
+    #         image_name = cached_image
+    #         self.logger.info(f"Using cached image: {image_name}")
+    #     if self.persistent:
+    #         assert self.container_name is not None
+    #     else:
+    #         # Make sure that we get a new container name just in case removing didn't work.
+    #         # Might be a fix for https://github.com/princeton-nlp/SWE-agent/issues/451
+    #         self.container_name = self._get_container_name(image_name)
+    #     self.container, self.parent_pids = get_container(self.container_name, image_name, persistent=self.persistent)
+    #     try:
+    #         client = docker.from_env(timeout=600)
+    #     except docker.errors.DockerException as e:
+    #         if "Error while fetching server API version" in str(e):
+    #             msg = "Docker is not running. Please start Docker and try again."
+    #         else:
+    #             msg = "Unknown docker exception occurred. Are you sure docker is running?"
+    #         raise RuntimeError(msg) from e
+    #     t0 = time.time()
+    #     self.container_obj = None
+    #     while time.time() - t0 < 60:
+    #         try:
+    #             self.container_obj = client.containers.get(self.container_name)
+    #         except docker.errors.NotFound:
+    #             self.logger.debug("Couldn't find container. Let's wait and retry.")
+    #             time.sleep(1)
+    #         else:
+    #             break
+    #     else:
+    #         print(f"{self.persistent=}")
+    #         available_containers = client.containers.list(all=True)
+    #         available_containers_info = json.dumps([str(c.attrs) for c in available_containers], indent=2)
+    #         print(available_containers_info)
+    #         msg = "Failed to get container object."
+    #         raise RuntimeError(msg)
+    #     self.logger.info("🌱 Environment Initialized")
+
+    def _init_scripts(self):
+        """
+        Initialize custom commands within container
+        """
+        self.communicate_with_handling(
+            "source /root/.bashrc",
+            error_msg="Failed to source .bashrc",
+        )
+        self.communicate_with_handling(
+            "mkdir -p /root/commands",
+            error_msg="Failed to create commands directory",
+        )
+        self.communicate_with_handling(
+            "touch /root/commands/__init__.py",
+            error_msg="Failed to create __init__.py",
+        )
+        self.communicate_with_handling(
+            "export PATH=$PATH:/root/commands",
+            error_msg="Failed to add commands directory to PATH",
+        )
+
+    def _communicate(
+        self,
+        input: str,
+        # timeout_duration=25,
+    ) -> TaskResult:
+        return self.hide.run_task(project_id=self.project.id, command=input)
+
+    def _check_syntax(self, input: str) -> tuple[TaskResult, bool]:
+        """
+        Saves environment variables to file
+        """
+        output = self._communicate(f"/bin/bash -n <<'EOF'\n{input}\nEOF\n")
+        return output, output.exitCode == 0
+
+    def communicate(
+        self,
+        input: str,
+        timeout_duration=25,
+    ) -> TaskResult:
+        """
+        Sends input to container and returns output
+
+        Args:
+            input: input to send to container
+
+        Returns:
+            output: output from container
+        """
+        if input.strip() != "exit":
+            output, valid = self._check_syntax(input)
+            if not valid:
+                return output  # shows syntax errors
+            output = self._communicate(
+                input,
             )
-            self.logger.debug("Ran install command")
-        if install_configs.get("post_install"):
-            self.logger.info("Running post-install commands...")
-            for post_install_cmd in install_configs["post_install"]:
-                self.communicate_with_handling(
-                    post_install_cmd,
-                    error_msg="Post-install commands failed to execute successfully",
-                )
-            self.logger.debug("Ran post-install commands")
+            return output
+        else:
+            self.hide.delete_project(self.project)
+            return TaskResult(exitCode=0, stdOut="", stdErr="")
 
-        self.logger.info("Installation step took %.2f seconds", time.perf_counter() - t0)
+    def communicate_with_handling(self, input: str, error_msg: str, timeout_duration=25) -> str:
+        """
+        Wrapper for communicate function that raises error if return code is non-zero
+
+        Args:
+            input: input to send to container
+            error_msg: error message to raise if return code is non-zero
+            timeout_duration: duration to wait for output
+
+        Returns:
+            output: output from container
+        """
+        output = self.communicate(input, timeout_duration=timeout_duration)
+        logs = f"stdout:\n{output.stdOut}\n\nstderr:\n{output.stdErr}"
+        if output.exitCode != 0:
+            self.logger.error(f"{error_msg}: {logs}")
+            self.close()
+            msg = f"{error_msg}: {logs}"
+            raise RuntimeError(msg)
+        return logs
+
+    def get_available_actions(self) -> list[str]:
+        """
+        Returns list of available actions in current environment state
+
+        Currently not in use.
+        """
+        return []
+
+    def get_pids(self, all_pids=False) -> list[list[str]]:
+        """
+        Gets list of processes running inside docker container
+
+        Args:
+            all_pids: whether to return all pids, or whether to exclude ps
+                and parent PIDs
+
+        Returns:
+            list of PIDs
+        """
+        pids = self.hide.run_task(project_id=self.project.id, command="ps -eo pid,comm --no-headers").stdOut.split("\n")
+        pids = [x.split() for x in pids if x]
+        if not all_pids:
+            pids = [x for x in pids if x[1] != "ps" and x[0] not in self.parent_pids]
+        return pids
+
+    def get_submission(self, output: str) -> str:
+        """
+        Function for extracting diff patch submission at the end of an episode.
+
+        Args:
+            output: `submit` observation
+
+        Returns:
+            submission: diff patch submission
+        """
+        pattern = r"\<\<SUBMISSION\|\|(.*)\|\|SUBMISSION\>\>"
+        match = re.search(pattern, output, re.DOTALL)
+        if match is None:
+            return None
+        return match.group(1)
 
     def add_commands(self, commands: list[dict]) -> None:
         """
@@ -1004,7 +609,7 @@ class SWEEnv(gym.Env):
         for command in commands:
             name = command["name"]
             contents = command["contents"]
-            copy_file_to_container(self.container_obj, contents, f"/root/commands/{name}")
+            self.copy_file_to_container(contents, f"/root/commands/{name}")
             if command["type"] == "source_file":
                 self.communicate_with_handling(
                     f"source /root/commands/{name}",
@@ -1029,19 +634,13 @@ class SWEEnv(gym.Env):
         """
         Send interrupt signal to container and exhaust stdout buffer with a communicate call
         """
-        assert self.container is not None
-        assert self.container_obj is not None
         pids = self.get_pids()
         for pid, cmd in pids:
             if pid not in self.parent_pids and cmd != "ps":
-                self.container_obj.exec_run(f"kill -9 {pid}")
-        try:
-            _ = read_with_timeout(self.container, self.get_pids, 20)
-        except TimeoutError:
-            pass
+                self.hide.run_task(project_id=self.project.id, command=f"kill -9 {pid}")
         try:
             output = self.communicate(input="echo 'interrupted'", timeout_duration=5)
-            assert output.strip().endswith("interrupted"), "container health check failed"
+            assert output.stdOut.strip().endswith("interrupted"), "container health check failed"
         except TimeoutError:
             msg = "Failed to interrupt container"
             raise RuntimeError(msg)
@@ -1141,3 +740,22 @@ class SWEEnv(gym.Env):
                 "any required changes onto the branch and then click "
                 "'Ready for Review' to bring it to the attention of the maintainers.",
             )
+
+    # TODO: Why not just use copy_anything_to_container?
+    def copy_file_to_container(self, contents: str, container_path: str) -> None:
+        """
+        Copies a given string into a Docker container at a specified path.
+
+        Args:
+            env: Development environment.
+            contents: The string to copy into the container.
+            container_path: The path inside the container where the string should be copied to.
+
+        Returns:
+            None
+        """
+        try:
+            self.hide.create_file(self.project.id, container_path, contents)
+        except Exception as e:
+            self.logger.error(f"An error occurred while copying file to container: {e}")
+            self.logger.error(traceback.format_exc())

@@ -57,51 +57,6 @@ def is_github_repo_url(data_path: str) -> bool:
     return GITHUB_REPO_URL_PATTERN.search(data_path) is not None
 
 
-# TODO: Why not just use copy_anything_to_container?
-def copy_file_to_container(container: Container, contents: str, container_path: str) -> None:
-    """
-    Copies a given string into a Docker container at a specified path.
-
-    Args:
-        container: Docker SDK container object.
-        contents: The string to copy into the container.
-        container_path: The path inside the container where the string should be copied to.
-
-    Returns:
-        None
-    """
-    temp_file_name = None
-
-    try:
-        # Create a temporary file
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            temp_file_name = temp_file.name
-            # Write the string to the temporary file and ensure it's written to disk
-            temp_file.write(contents.encode("utf-8"))
-            temp_file.flush()
-            os.fsync(temp_file.fileno())
-
-        # Create a TAR archive in memory containing the temporary file
-        with tempfile.NamedTemporaryFile():
-            with open(temp_file_name, "rb") as temp_file:
-                # Prepare the TAR archive
-                with BytesIO() as tar_stream:
-                    with tarfile.open(fileobj=tar_stream, mode="w") as tar:
-                        tar_info = tarfile.TarInfo(name=os.path.basename(container_path))
-                        tar_info.size = os.path.getsize(temp_file_name)
-                        tar.addfile(tarinfo=tar_info, fileobj=temp_file)
-                    tar_stream.seek(0)
-                    # Copy the TAR stream to the container
-                    container.put_archive(path=os.path.dirname(container_path), data=tar_stream.read())
-
-    except Exception as e:
-        logger.error(f"An error occurred: {e}")
-        logger.error(traceback.format_exc())
-    finally:
-        # Cleanup: Remove the temporary file if it was created
-        if temp_file_name and os.path.exists(temp_file_name):
-            os.remove(temp_file_name)
-
 
 def copy_anything_to_container(container: Container, host_path: str, container_path: str) -> None:
     """Copy files or directories from host to container

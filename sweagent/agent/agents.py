@@ -725,14 +725,16 @@ class Agent:
         assert self.config is not None  # mypy
         env_vars = dict()
         for var in self.config.env_variables:
-            env_vars[var] = env.communicate(f"echo ${var}").strip()
+            output = env.communicate(f"echo ${var}")
+            env_vars[var] = output.stdOut.strip()
         return env_vars
 
     def call_subroutine(self, agent_name: str, sub_action, env: SWEEnv):
         """Call subroutine"""
         assert self.config is not None  # mypy
         env_vars = self.get_environment_vars(env)
-        cwd = env.communicate("pwd -P").strip()
+        output = env.communicate("pwd -P")
+        cwd = output.stdOut.strip()
         init_observation = self.config._subroutines[agent_name].init_observation
         if init_observation is not None:
             obs, _, _, _ = env.step(init_observation.format(args=sub_action["args"]))
@@ -772,6 +774,7 @@ class Agent:
 
         Args:
             setup_args: Arguments to pass to the agent's setup method.
+                e.g. setup_args = {"issue": issue, "files": files, "test_files": test_files, "tests": tests}
             env: The environment to run the agent on.
             observation: Output from environment setup
             traj_dir: Directory to save the trajectory to
@@ -786,14 +789,11 @@ class Agent:
         """
         done = False
         # mypy checks
-        assert env.container_obj is not None
-        assert env.record is not None
+        assert "issue" in setup_args
         assert self.config is not None
 
-        if env.container_obj.id != self.last_container_id:
-            self.logger.info(f"Initializing agent settings for container {env.container_obj.id}")
-            self.init_environment_vars(env)
-            self.last_container_id = env.container_obj.id
+        self.init_environment_vars(env)
+
         # Re-initialize primary
         self.setup(setup_args, init_model_stats)
 
@@ -803,12 +803,21 @@ class Agent:
         # Run action/observation loop
         trajectory = []
         info = {}
-        traj_log_path = traj_dir / (env.record["instance_id"] + ".traj")
+        issue = setup_args["issue"]
+        traj_log_path = traj_dir / (issue["instance_id"] + ".traj")
+
         self.logger.info("Trajectory will be saved to %s", traj_log_path)
+
         while not done:
             for hook in self.hooks:
                 hook.on_step_start()
-            state = env.communicate(self.state_command) if self.state_command else None
+            output = env.communicate(self.state_command) if self.state_command else None
+
+            if output:
+                state = output.stdOut if output.stdOut else output.stdErr
+            else:
+                state = None
+
             thought, action, output = self.forward(observation, env.get_available_actions(), state)
             for hook in self.hooks:
                 hook.on_actions_generated(thought=thought, action=action, output=output)
