@@ -330,7 +330,7 @@ class Main:
         logger.info(f"💽 Loaded dataset from {self.data_path}")
 
         self.agent = Agent("primary", args.agent)
-        self.hide = HideClient(base_url="localhost:8000") # TODO: make this configurable
+        self.hide = HideClient(base_url="http://localhost:8080") # TODO: make this configurable
         self.env_service = SWEEnvService(args=args.environment, hide=self.hide)
         self.traj_dir = Path("trajectories") / Path(getuser()) / args.run_name
         self.traj_dir.mkdir(parents=True, exist_ok=True)
